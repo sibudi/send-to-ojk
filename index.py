@@ -23,7 +23,6 @@ import smtplib, ssl
 
 
 logger = logging.getLogger()
-environ = os.environ
 
 #disable sftp Host Key checking
 cnopts = pysftp.CnOpts()
@@ -34,6 +33,7 @@ yesterday = date.today() if (datetime.now()+timedelta(hours=7)).strftime('%Y%m%d
 
 def handler(event, context):
     try:
+        environ = os.environ
         payload = json.loads(event)['payload']
         filename = '820053' + yesterday.strftime('%Y%m%d') + 'SIK01'
         filepath = environ['HOME'] + '/' +  filename
@@ -77,7 +77,8 @@ def handler(event, context):
                                     WHEN (a.status in (7,8) AND a.orderType = 0)
                                         THEN a.amountApply
                                     WHEN (a.status in (7,8) AND a.orderType = 3)
-                                        THEN (PERIOD_DIFF(DATE_FORMAT(d.refundTime, '%Y%m'), DATE_FORMAT(a.refundTime, '%Y%m')) + 1) * d.billAmout
+                                        #THEN (PERIOD_DIFF(DATE_FORMAT(d.refundTime, '%Y%m'), DATE_FORMAT(a.refundTime, '%Y%m')) + 1) * d.billAmout
+                                        THEN IF((a.refundTime = d.refundTime), d.billAmout, IF((a.refundTime = d1.refundTime), d1.billAmout * 3, d2.billAmout *2)) #edit20200210
                                     ELSE 0 #jika order ext sudah lunas
                                 END sisa_pinjaman_berjalan
                                 , date(a.refundTime) tgl_jatuh_tempo_pinjaman
@@ -122,8 +123,8 @@ def handler(event, context):
                                         THEN IF(d1.actualRefundTime is NULL, 
                                             greatest(COALESCE(datediff(subdate(current_date, 1), date(d1.refundTime)), 0), 0), 
                                             IF(d2.actualRefundTime is NULL, 
-                                                greatest(coalesce(datediff(subdate(current_date, 1), date(d2.refundTime)), 0), coalesce(datediff(date(d1.actualRefundTime), date(d1.refundTime)), 0)), 
-                                                greatest(coalesce(datediff(subdate(current_date, 1), date(d.refundTime)), 0), coalesce(datediff(date(d1.actualRefundTime), date(d1.refundTime)), 0), coalesce(datediff(date(d2.actualRefundTime), date(d2.refundTime)), 0))
+                                                greatest(coalesce(datediff(subdate(current_date, 1), date(d2.refundTime)), 0), coalesce(datediff(date(d1.actualRefundTime), date(d1.refundTime)), 0), 0), #edit20200210
+                                                greatest(coalesce(datediff(subdate(current_date, 1), date(d.refundTime)), 0), coalesce(datediff(date(d1.actualRefundTime), date(d1.refundTime)), 0), coalesce(datediff(date(d2.actualRefundTime), date(d2.refundTime)), 0), 0) #edit20200210
                                             )
                                         )
                                     WHEN (a.status in (10,11) AND a.orderType = 3)
@@ -258,7 +259,7 @@ def handler(event, context):
 
 
             #send notification
-            send_notification(filename, file, message)
+            send_notification(filename, file, message, environ, context)
 
             #delete file zip.out
             silentremove(filepath + '.zip.out')
@@ -326,7 +327,7 @@ def sftp_get(filename, filepath):
             sftp.get(filename, filepath, preserve_mtime=True)
 
 
-def send_notification(filename, file, message):
+def send_notification(filename, file, message, environ, context):
     filename = '"filename":' + '"' + filename + '.zip.out"'
     file = '"content":' + '"' + file.decode('utf-8') + '"'
     attachments = '{' + filename + ', ' + file + '}'
@@ -337,5 +338,7 @@ def send_notification(filename, file, message):
                 "to": "setiya.budi@do-it.id",
                 "attachments": [ json.loads(attachments) ]
             }
-    headers = {'Content-Type': 'application/json', 'x-authorization-token': 'lgezRLxR84n$9@'}
+    notification_config = get_configuration(environ, context, 'notification') 
+    token = notification_config['x-authorization-token']
+    headers = {'Content-Type': 'application/json', 'x-authorization-token': token}
     resp = requests.post('https://notificationapi.doitglotech.co.id/email', data=json.dumps(data), headers=headers)
