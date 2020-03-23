@@ -1,28 +1,16 @@
-from aliyunsdkkms.request.v20160120.DecryptRequest import DecryptRequest
-from aliyunsdkkms.request.v20160120.EncryptRequest import EncryptRequest
-from aliyunsdkcore.client import AcsClient
-from aliyunsdkcore.auth import credentials
-
 from datetime import date, datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from tablestore import *
 
 import base64
 import csv
 import errno
+import helper
 import json
 import logging
 import os
 import pyminizip
-import pymysql
 import pysftp
-import requests
-import smtplib, ssl
 
 
-
-logger = logging.getLogger()
 
 #disable sftp Host Key checking
 cnopts = pysftp.CnOpts()
@@ -31,32 +19,46 @@ cnopts.hostkeys = None
 #yesterday = date.today() - timedelta(days=1)
 yesterday = date.today() if (datetime.now()+timedelta(hours=7)).strftime('%Y%m%d') == (date.today()+timedelta(days=1)).strftime('%Y%m%d') else date.today() - timedelta(days=1)
 
+logger = {}
+SFTP_CONFIG = {}
+def init(context):
+    global logger
+    global SFTP_CONFIG
+    logger = logging.getLogger()
+    logger.info('Initializing. . .')
+  
+    # Get SQL connection
+    config = helper.get_configuration(context, 'apsara')
+    helper.SQL_CONNECTION = helper.connect_to_mysql(context, config)
+
+    # Get report config
+    helper.NOTIFICATION_CONFIG = helper.get_configuration(context, 'send-to-ojk')
+
+    #Get sftp config
+    SFTP_CONFIG = helper.get_configuration(context, 'ojk-sftp')
+    return ""
+
 def handler(event, context):
     try:
         environ = os.environ
         payload = json.loads(event)['payload']
-        filename = '820053' + yesterday.strftime('%Y%m%d') + 'SIK01'
-        filepath = environ['HOME'] + '/' +  filename
 
-        apsara_config = get_configuration(environ, context, 'apsara')
-        connection = connect_to_apsara(context, apsara_config)
-
-
+        connection = helper.SQL_CONNECTION
         
         if payload == "SEND_TO_OJK":
             #delete
             with connection.cursor() as cursor:
-                sql = """ delete from sik_fdc where tgl_pelaporan_data = subdate(current_date, 1) """
+                sql = """ delete from reporting.sik_fdc where tgl_pelaporan_data = subdate(current_date, 1) """
 
                 cursor.execute(sql)
 
             connection.commit()
-
+            logger.info("deleted")
 
             #insert
             with connection.cursor() as cursor:
                 sql = """
-                            insert into sik_fdc
+                            insert into reporting.sik_fdc
                             select null id
                                 , 820053 id_penyelenggara
                                 , b.uuid id_borrower
@@ -182,7 +184,7 @@ def handler(event, context):
                 cursor.execute(sql)
 
             connection.commit()
-
+            logger.info("inserted")
 
             #read
             with connection.cursor() as cursor:
@@ -204,25 +206,33 @@ def handler(event, context):
                             status_pinjaman_dpd,
                             status_pinjaman_max_dpd,
                             status_pinjaman
-                        FROM sik_fdc 
+                        FROM reporting.sik_fdc 
                         where tgl_pelaporan_data = subdate(current_date,1)
                 """
                 cursor.execute(sql)
-                data = cursor.fetchall()
-                csv_column_order = list(data[0].keys())
+                data_csv = cursor.fetchall()
+                csv_column_order = list(data_csv[0].keys())
+                logger.info("read")
 
+            #read counter
+            sikCounter = read_counter(connection, 0)
+
+            filename = SFTP_CONFIG['username'] + yesterday.strftime('%Y%m%d') + 'SIK' + sikCounter
+            filepath = environ['HOME'] + '/' +  filename
+            logger.info(f"{filename} {filepath}")
 
             with open(filepath + '.csv', mode='w', newline='') as f:
                 writer = csv.DictWriter(f, delimiter='|', quotechar='"', quoting=csv.QUOTE_MINIMAL, fieldnames=csv_column_order)
-                for row in data:
+                for row in data_csv:
                     writer.writerow(row)
 
-
+        
             #zipfile
-            pyminizip.compress(filepath + '.csv', None, filepath + '.zip' , 'HbWSJjvMY7#2', 0)
+            zip_password = helper.decrypt_string(context, SFTP_CONFIG['zip_password'])
+            pyminizip.compress(filepath + '.csv', None, filepath + '.zip' , zip_password, 0)
 
             #put file to sftp
-            sftp_put(filepath + '.zip')
+            sftp_put(context, filepath + '.zip')
 
             #delete file csv
             silentremove(filepath + '.csv')
@@ -231,8 +241,14 @@ def handler(event, context):
 
 
         elif payload == "CHECK_OJK_RESULT":
+            sikCounter = read_counter(connection, 1)
+            
+            filename = SFTP_CONFIG['username'] + yesterday.strftime('%Y%m%d') + 'SIK' + sikCounter
+            filepath = environ['HOME'] + '/' +  filename
+            logger.info(f"{filename} {filepath}")
+
             #get file from sftp
-            sftp_get(filename + '.zip.out', filepath + '.zip.out')
+            sftp_get(context, filename + '.zip.out', filepath + '.zip.out')
 
             #read file
             with open(filepath + '.zip.out', 'rb') as reader:
@@ -242,7 +258,7 @@ def handler(event, context):
             with connection.cursor() as cursor:
                 sql = """
                        select tgl_pelaporan_data, count(*) count
-                       from sik_fdc 
+                       from reporting.sik_fdc 
                        where tgl_pelaporan_data >= subdate(current_date, 7) and tgl_pelaporan_data <= subdate(current_date,1) 
                        group by tgl_pelaporan_data 
                        order by 1
@@ -268,44 +284,6 @@ def handler(event, context):
         logger.error(e)
 
 
-
-def get_configuration(environ, context, group_code):
-    creds = context.credentials
-    client = OTSClient(environ['TABLE_STORE_ENDPOINT'], 
-        creds.accessKeyId, creds.accessKeySecret, environ['TABLE_STORE_INSTANCE_NAME'], sts_token=creds.securityToken)
-    primary_key = [('group', group_code)]
-    columns_to_get = []
-    consumed, return_row, next_token = client.get_row(environ['TABLE_STORE_TABLE_NAME'], primary_key, columns_to_get, None,1)
-    json = {}
-    for att in return_row.attribute_columns:
-        json[att[0]]=att[1]
-    return json
-
-
-def connect_to_apsara(context, apsara_config):
-    return pymysql.connect(
-        host=apsara_config['host'],
-        user=apsara_config['username'],
-        password=decrypt_string(context, apsara_config['password']),
-        db=apsara_config['db'],
-        charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor
-    )
-
-
-def decrypt_string(context, encrypted_string):
-    creds = context.credentials
-    sts_credentials = credentials.StsTokenCredential(creds.accessKeyId, creds.accessKeySecret, creds.securityToken) 
-    client = AcsClient(
-        region_id = 'ap-southeast-5',
-        credential = sts_credentials
-    )
-    request = DecryptRequest()
-    request.set_CiphertextBlob(encrypted_string)
-    response = str(client.do_action_with_exception(request), encoding='utf-8')
-    return json.loads(response)['Plaintext']
-
-
 def silentremove(filename):
     try:
         os.remove(filename)
@@ -315,30 +293,62 @@ def silentremove(filename):
             raise # re-raise exception if a different error occurred
 
 
-def sftp_put(filepath):
-    with pysftp.Connection('pusdafil.afpi.or.id', username='820053', password='Ht7VyhHMa7Akyetk', cnopts=cnopts) as sftp:
+def sftp_put(context, filepath):
+    password = helper.decrypt_string(context, SFTP_CONFIG['password'])
+    with pysftp.Connection(SFTP_CONFIG['endpoint'], username=SFTP_CONFIG['username'], password=password, cnopts=cnopts) as sftp:
         with sftp.cd('in'):
             sftp.put(filepath)
 
 
-def sftp_get(filename, filepath):
-    with pysftp.Connection('pusdafil.afpi.or.id', username='820053', password='Ht7VyhHMa7Akyetk', cnopts=cnopts) as sftp:
+def sftp_get(context, filename, filepath):
+    password = helper.decrypt_string(context, SFTP_CONFIG['password'])
+    with pysftp.Connection(SFTP_CONFIG['endpoint'], username=SFTP_CONFIG['username'], password=password, cnopts=cnopts) as sftp:
         with sftp.cd('out'):
             sftp.get(filename, filepath, preserve_mtime=True)
+
+
+def read_counter(connection, check_only):
+    with connection.cursor() as cursor:
+        sql = "select counter from reporting.sik_fdc_dailycounter where tgl_pelaporan_data = subdate(current_date, 1)"
+        cursor.execute(sql)
+        data = cursor.fetchone()
+
+    if (check_only == 1):
+        return str(data['counter']).zfill(2) if (data is not None) else '00'
+
+    counter = 0
+    sikCounter = ''
+    if (data is not None):
+        logger.info(f"last counter = {data['counter']}")
+        counter = data['counter'] + 1
+        sikCounter = str(counter).zfill(2)
+
+        with connection.cursor() as cursor:
+            sql = f"update reporting.sik_fdc_dailycounter set counter = {counter} where tgl_pelaporan_data = subdate(current_date, 1)"
+            cursor.execute(sql)
+
+    else:
+        logger.info(f"last counter = 0")
+        counter = 1
+        sikCounter = '01'
+
+        with connection.cursor() as cursor:
+            sql = f"insert into reporting.sik_fdc_dailycounter (tgl_pelaporan_data, counter) values (subdate(current_date,1), 1)"
+            cursor.execute(sql)
+    
+    connection.commit()
+    logger.info(f"current counter = {counter} ; sikfile = {sikCounter}")
+    logger.info("updated or inserted")
+    
+    return sikCounter
 
 
 def send_notification(filename, file, message, environ, context):
     filename = '"filename":' + '"' + filename + '.zip.out"'
     file = '"content":' + '"' + file.decode('utf-8') + '"'
     attachments = '{' + filename + ', ' + file + '}'
-    data = {
-                "message": message,
-                "subject": "SIK FDC Notification " + yesterday.strftime('%Y%m%d'),
-                "cc": "setiya.budi@do-it.id",
-                "to": "setiya.budi@do-it.id",
-                "attachments": [ json.loads(attachments) ]
-            }
-    notification_config = get_configuration(environ, context, 'notification') 
-    token = notification_config['x-authorization-token']
-    headers = {'Content-Type': 'application/json', 'x-authorization-token': token}
-    resp = requests.post('https://notificationapi.doitglotech.co.id/email', data=json.dumps(data), headers=headers)
+    subject = "SIK FDC Notification " + yesterday.strftime('%Y%m%d'),
+    to = helper.NOTIFICATION_CONFIG['to']
+    cc = helper.NOTIFICATION_CONFIG['cc'] if 'cc' in helper.NOTIFICATION_CONFIG else ""
+    attachments = [ json.loads(attachments) ]
+    helper.send_email(context.function.name, subject, message, to, cc, None, attachments)
