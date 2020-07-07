@@ -83,21 +83,54 @@ def handler(event, context):
                                         THEN IF((a.refundTime = d.refundTime), d.billAmout, IF((a.refundTime = d1.refundTime), d1.billAmout * 3, d2.billAmout *2)) #edit20200210
                                     ELSE 0 #jika order ext sudah lunas
                                 END sisa_pinjaman_berjalan
-                                , date(a.refundTime) tgl_jatuh_tempo_pinjaman
+                                , IF (a.orderType <> 3, date(a.refundTime),
+                                    IF(
+                                        (timestamp(current_date) > d.refundTime), date(d.refundTime),
+                                        IF (
+                                            (timestamp(current_date) > d2.refundTime), date(d2.refundTime),
+                                                date(d1.refundTime)
+                                        )
+                                    )
+                                ) tgl_jatuh_tempo_pinjaman #update_20200615
                                 , CASE 
-                                    WHEN (a.status in (7,8,10,11) AND datediff(COALESCE(a.actualRefundTime, subdate(current_date, 1)), date(a.refundTime)) < 30 AND a.orderType in (0,3)) 
+                                    WHEN (a.status in (10,11) AND datediff(a.actualRefundTime, date(a.refundTime)) < 30 AND a.orderType in (0,3)) #update_20200615
+                                        OR (a.status in (7,8) AND a.orderType = 0 AND datediff(subdate(current_date, 1), date(a.refundTime)) < 30) #tambahan update_20200615
+                                        OR (a.status in (7,8) AND a.orderType = 3 
+                                            AND IF(
+                                                    (timestamp(current_date) > d.refundTime), datediff(subdate(current_date, 1), date(d.refundTime)) < 30,
+                                                        IF (
+                                                            (timestamp(current_date) > d2.refundTime), datediff(subdate(current_date, 1), date(d2.refundTime)) < 30,
+                                                                datediff(subdate(current_date, 1), date(d1.refundTime)) < 30
+                                                        )
+                                                )											
+                                            ) #tambahan update_20200615
                                         OR (a.status in (10,11) AND f.status in (7,8,10,11) AND datediff(COALESCE(f.actualRefundTime, subdate(current_date, 1)), date(f.refundTime)) < 30 AND a.orderType = 2)
                                         THEN 1
                                     WHEN (a.status in (10,11) AND (COALESCE(datediff(a.actualRefundTime, a.refundTime), 0) >= 30 AND COALESCE(datediff(a.actualRefundTime, a.refundTime), 0) <= 90) AND a.orderType in (0,3)) 
-                                        OR (a.status in (7,8) AND (COALESCE(datediff(subdate(current_date, 1), date(a.refundTime)), 0) >= 30 AND COALESCE(datediff(subdate(current_date, 1), date(a.refundTime)), 0) <= 90) AND a.orderType in (0,3))
+                                        OR (a.status in (7,8) AND (datediff(subdate(current_date, 1), date(a.refundTime)) >= 30 AND datediff(subdate(current_date, 1), date(a.refundTime)) <= 90) AND a.orderType = 0) #update_20200615
+                                        OR (a.status in (7,8) AND IF(
+                                                                    (timestamp(current_date) > d.refundTime), datediff(subdate(current_date, 1), date(d.refundTime)) >= 30 AND datediff(subdate(current_date, 1), date(d.refundTime)) <= 90,
+                                                                        IF(
+                                                                            (timestamp(current_date) > d2.refundTime), datediff(subdate(current_date, 1), date(d2.refundTime)) >= 30 AND datediff(subdate(current_date, 1), date(d2.refundTime)) <= 90,
+                                                                                datediff(subdate(current_date, 1), date(d1.refundTime)) >= 30 AND datediff(subdate(current_date, 1), date(d1.refundTime)) <= 90
+                                                                        )
+                                                                ) AND a.orderType = 3) #tambahan update_20200615
                                         OR (a.status in (10,11) AND f.status in (10,11) AND (datediff(f.actualRefundTime, f.refundTime) >= 30 AND datediff(f.actualRefundTime, f.refundTime) <= 90) AND a.orderType = 2)
                                         OR (a.status in (10,11) AND f.status in (7,8) AND (datediff(subdate(current_date, 1), date(f.refundTime)) >= 30 AND datediff(subdate(current_date, 1), date(f.refundTime)) <= 90) AND a.orderType = 2)
                                         THEN 2
                                     ELSE 3
                                 END id_kualitas_pinjaman
                                 , CASE
-                                    WHEN (a.status in (7,8) AND a.orderType in (0,3))
-                                        THEN greatest(COALESCE(datediff(subdate(current_date, 1), date(a.refundTime)), 0), 0)
+                                    WHEN (a.status in (7,8) AND a.orderType = 0) #update_20200615
+                                        THEN greatest(datediff(subdate(current_date, 1), date(a.refundTime)), 0)
+                                    WHEN (a.status in (7,8) AND a.orderType = 3) #tambahan update_20200615
+                                        THEN IF(
+                                                (timestamp(current_date) > d.refundTime), greatest(datediff(subdate(current_date, 1), date(d.refundTime)), 0), 
+                                                    IF(
+                                                        (timestamp(current_date) > d2.refundTime), greatest(datediff(subdate(current_date, 1), date(d2.refundTime)), 0), 
+                                                            greatest(datediff(subdate(current_date, 1), date(d1.refundTime)), 0)
+                                                    )
+                                            )
                                     WHEN (a.status in (10,11) AND a.orderType = 2 AND f.status in (7,8)) 
                                         THEN greatest(COALESCE(datediff(subdate(current_date, 1), date(f.refundTime)), 0), 0) #jika order ext blum lunas, hari keterlambatan terakhir = hari keterlambatan orderType 1
                                     WHEN (a.status in (10,11) AND a.orderType in (0,3)) 
@@ -151,7 +184,7 @@ def handler(event, context):
                             left join ordHistory c
                                 on a.uuid = c.orderId
                                 and c.status = 20
-                                and c.updateTime = (select max(c2.updateTime) from ordHistory c2 where c2.orderId = c.orderId and c2.status = 20)
+                                and c.updateTime = (select max(c2.updateTime) from ordHistory c2 where c2.orderId = c.orderId and c2.status = 20 and c2.disabled = 0)
                             left join ordBill d
                                 on a.uuid = d.orderNo
                                 and a.orderType = 3
@@ -174,11 +207,11 @@ def handler(event, context):
                             and a.status in (7, 8, 10, 11)
                             and a.orderType in (0, 2, 3)
                             and (
-                                (
-                                date(a.updateTime) = subdate(CURRENT_DATE,1) and a.orderType <> 3)
-                                or (datediff(subdate(current_date, 1), date(a.refundTime)) <= 91 and a.status in (7,8))
+                                (date(a.updateTime) = subdate(CURRENT_DATE,1) and a.orderType in (0, 1))	#update_20200615
+                                or (datediff(subdate(current_date, 1), date(a.refundTime)) <= 91 and a.status in (7,8) and a.orderType = 0)	#update_20200615
                                 or (datediff(subdate(current_date, 1), date(f.refundTime)) <= 91 and f.status in (7,8))
                                 or (a.orderType = 3 and a.status in (10,11) and date(a.actualRefundTime) = subdate(current_date, 1))
+                                or (a.orderType = 3 and a.status in (7, 8) and datediff(subdate(current_date, 1), date(d.refundTime)) <= 91)# tambahan update_20200615
                             )
                 """
                 cursor.execute(sql)
@@ -211,7 +244,8 @@ def handler(event, context):
                 """
                 cursor.execute(sql)
                 data_csv = cursor.fetchall()
-                csv_column_order = list(data_csv[0].keys())
+                column_name = cursor.description
+                column_name = [tupl[0] for tupl in list(column_name)]
                 logger.info("read")
 
             #read counter
@@ -222,7 +256,7 @@ def handler(event, context):
             logger.info(f"{filename} {filepath}")
 
             with open(filepath + '.csv', mode='w', newline='') as f:
-                writer = csv.DictWriter(f, delimiter='|', quotechar='"', quoting=csv.QUOTE_MINIMAL, fieldnames=csv_column_order)
+                writer = csv.DictWriter(f, delimiter='|', quotechar='"', quoting=csv.QUOTE_MINIMAL, fieldnames=column_name)
                 for row in data_csv:
                     writer.writerow(row)
 
@@ -243,16 +277,31 @@ def handler(event, context):
         elif payload == "CHECK_OJK_RESULT":
             sikCounter = read_counter(connection, 1)
             
-            filename = SFTP_CONFIG['username'] + yesterday.strftime('%Y%m%d') + 'SIK' + sikCounter
-            filepath = environ['HOME'] + '/' +  filename
-            logger.info(f"{filename} {filepath}")
+            filename = []
+            content = []
+            printf = []
 
-            #get file from sftp
-            sftp_get(context, filename + '.zip.out', filepath + '.zip.out')
+            filename.append(SFTP_CONFIG['username'] + yesterday.strftime('%Y%m%d') + 'SIK' + sikCounter + '.zip.out')
+            filename.append('statistic_' + SFTP_CONFIG['username'] + '.json')
 
-            #read file
-            with open(filepath + '.zip.out', 'rb') as reader:
-                file = base64.b64encode(reader.read())
+            for item in filename:
+                filepath = environ['HOME'] + '/' +  item
+                
+                #get file from sftp
+                sftp_get(context, item, filepath)
+
+                #read file
+                with open(filepath, 'rb') as reader:
+                    printf.append(reader.read())
+
+                #delete downloaded file
+                silentremove(filepath)
+            
+                logger.info(f"{item} {filepath}")
+            
+
+            content = map(base64.b64encode, printf)
+            printf = [item.decode('utf-8') for item in printf]
 
             #read db for construct message
             with connection.cursor() as cursor:
@@ -271,14 +320,27 @@ def handler(event, context):
             message += f"<tr><th>tanggal</th> <th>count</th></tr>"
             for row in data: #print as row
                 message += f"<tr><td>{row['tgl_pelaporan_data']}</td> <td>{row['count']}</td></tr>"
+            
             message += f"</table>"
+            message += f"<p>{filename[0]}:<br /> <pre><div style='padding-left:2em'>{printf[0]}</div></pre></p>"
+            try:
+                printf_json = json.loads(printf[1])
+            except ValueError as e:
+                printf_json = [{}]
+                logger.error('invalid json: %s' % e)
 
+            message += f"<p>{filename[1]}:<br />" 
+            message += f"<pre><div style='padding-left:2em'>"
+            for key in printf_json[0]:
+                message += f"{key}: {printf_json[0][key]}<br/>"
+            
+            message += f"</div></pre></p>"
 
             #send notification
-            send_notification(filename, file, message, environ, context)
+            content = [item.decode('utf-8') for item in content]
+            attachments = [*zip(filename, content)]
+            send_notification(attachments, message, environ, context)
 
-            #delete file zip.out
-            silentremove(filepath + '.zip.out')
 
     except Exception as e:
         logger.error(e)
@@ -343,12 +405,13 @@ def read_counter(connection, check_only):
     return sikCounter
 
 
-def send_notification(filename, file, message, environ, context):
-    filename = '"filename":' + '"' + filename + '.zip.out"'
-    file = '"content":' + '"' + file.decode('utf-8') + '"'
-    attachments = '{' + filename + ', ' + file + '}'
-    subject = "SIK FDC Notification " + yesterday.strftime('%Y%m%d'),
+def send_notification(attachments, message, environ, context):
+    subject = f"SIK FDC Notification {yesterday.strftime('%Y%m%d')}"
     to = helper.NOTIFICATION_CONFIG['to']
     cc = helper.NOTIFICATION_CONFIG['cc'] if 'cc' in helper.NOTIFICATION_CONFIG else ""
-    attachments = [ json.loads(attachments) ]
+    
+    # convert list of tuples into list of dictionary
+    keys = ('filename', 'content')
+    attachments = [dict(zip(keys, values)) for values in attachments]
+    
     helper.send_email(context.function.name, subject, message, to, cc, None, attachments)
